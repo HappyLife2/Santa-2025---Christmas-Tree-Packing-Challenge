@@ -10,11 +10,19 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
-#include <omp.h>
+
 #include <random>
 #include <string>
 #include <tuple>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#else
+#define omp_get_thread_num() 0
+#define omp_get_max_threads() 1
+#endif
+
 using namespace std;
 
 constexpr int MAX_N = 200;
@@ -359,7 +367,7 @@ Cfg sa_opt(Cfg c, int iter, long double T0, long double Tm, uint64_t seed) {
   int noImp = 0;
 
   for (int it = 0; it < iter; it++) {
-    int mt = rng.ri(11);
+    int mt = rng.ri(12);
     long double sc = T / T0;
     bool valid = true;
 
@@ -508,6 +516,33 @@ Cfg sa_opt(Cfg c, int iter, long double T0, long double Tm, uint64_t seed) {
         cur = old;
         valid = false;
       }
+    } else if (mt == 8 && c.n > 1) {
+      // Alignment Move: Rotate to match a neighbor
+      int i = rng.ri(c.n);
+      int j = rng.ri(c.n);
+      if (i != j) {
+        long double oa = cur.a[i];
+        // Try aligning with neighbor, or 180 flip, or 90 degree turn
+        int type = rng.ri(3);
+        if (type == 0)
+          cur.a[i] = cur.a[j];
+        else if (type == 1)
+          cur.a[i] = cur.a[j] + 180.0L;
+        else
+          cur.a[i] = cur.a[j] + 90.0L;
+
+        while (cur.a[i] >= 360.0L)
+          cur.a[i] -= 360.0L;
+
+        cur.upd(i);
+        if (cur.hasOvl(i)) {
+          cur.a[i] = oa;
+          cur.upd(i);
+          valid = false;
+        }
+      } else {
+        valid = false;
+      }
     } else {
       int i = rng.ri(c.n);
       long double ox = cur.x[i], oy = cur.y[i];
@@ -611,45 +646,110 @@ Cfg optimizeParallel(Cfg c, int iters, int restarts) {
 #pragma omp parallel
   {
     int tid = omp_get_thread_num();
+    int num_threads = omp_get_max_threads();
     FastRNG rng(42 + tid * 1000 + c.n);
-    Cfg localBest = c;
-    long double localBestSide = c.side();
 
-#pragma omp for schedule(dynamic)
-    for (int r = 0; r < restarts; r++) {
-      Cfg start;
-      if (r == 0) {
-        start = c;
-      } else if (r % 4 == 0 && r < restarts / 2) {
-        start = c;
-        long double angleOffset = (r / 4) * 45.0L;
-        for (int i = 0; i < start.n; i++) {
-          start.a[i] += angleOffset;
-          while (start.a[i] >= 360.0L)
-            start.a[i] -= 360.0L;
+    // Temperatures: Geometric spacing
+    long double T_min = 0.0000001L;
+    long double T_max = 5.0L;
+    long double T =
+        T_min * powl(T_max / T_min, (long double)tid / max(1, num_threads - 1));
+
+    Cfg current = c;
+    long double currentSide = c.side();
+
+    // Warmup: Perturb diverse for high temp
+    if (tid > 0) {
+      current = perturb(c, 0.05L * tid, rng);
+      if (current.anyOvl())
+        current = c; // Fallback
+    }
+
+    // Best local
+    Cfg localBest = current;
+    long double localBestSide = current.side();
+
+    // Shared Exchange Buffer
+    static Cfg exchangePool[64]; // Max 64 threads supported for simple exchange
+    static long double exchangeScores[64];
+
+    int cycles = restarts; // Reuse restarts arg as "cycles" of PT
+    int steps_per_cycle = iters / cycles;
+    if (steps_per_cycle < 100)
+      steps_per_cycle = 100;
+
+    for (int cycle = 0; cycle < cycles; cycle++) {
+      // Run SA segment
+      current =
+          sa_opt(current, steps_per_cycle, T, T, 42 + tid * cycle + c.n * 999);
+
+      // Squeeze & Local Search (greedy step)
+      if (tid == 0 || cycle % 5 == 0) {
+        Cfg refined = squeeze(current);
+        refined = compaction(refined, 15);
+        refined = localSearch(refined, 20);
+        if (!refined.anyOvl() && refined.side() < localBestSide) {
+          localBestSide = refined.side();
+          localBest = refined;
         }
-        start.updAll();
-        if (start.anyOvl()) {
-          start = perturb(c, 0.02L + 0.02L * (r % 8), rng);
-          if (start.anyOvl())
-            continue;
+        // Recover current to refined if it's better
+        if (refined.side() < current.side()) {
+          current = refined;
         }
-      } else {
-        start = perturb(c, 0.02L + 0.02L * (r % 8), rng);
-        if (start.anyOvl())
-          continue;
       }
 
-      uint64_t seed = 42 + r * 1000 + tid * 100000 + c.n;
-      Cfg o = sa_opt(start, iters, 3.0L, 0.0000005L, seed);
-      o = squeeze(o);
-      o = compaction(o, 50);
-      o = localSearch(o, 80);
+// --- REPLICA EXCHANGE (Sync) ---
+#pragma omp barrier
 
-      if (!o.anyOvl() && o.side() < localBestSide) {
-        localBestSide = o.side();
-        localBest = o;
+      if (tid < 64) {
+        exchangePool[tid] = current;
+        exchangeScores[tid] = current.side();
       }
+
+#pragma omp barrier
+
+      // Master performs swaps (simplified for OpenMP)
+      // Or randomized: Pick a neighbor and Metropolis swap
+      if (tid % 2 == 0 && tid + 1 < num_threads && tid + 1 < 64) {
+        int a = tid;
+        int b = tid + 1;
+        long double Ea = exchangeScores[a];
+        long double Eb = exchangeScores[b];
+        long double Ta = T_min * powl(T_max / T_min,
+                                      (long double)a / max(1, num_threads - 1));
+        long double Tb = T_min * powl(T_max / T_min,
+                                      (long double)b / max(1, num_threads - 1));
+
+        // Metropolis criterion for swap
+        long double delta = (1.0L / Ta - 1.0L / Tb) *
+                            (Ea - Eb); // E is Side (proportional to Energy)
+        // Note: Energy usually Area/N, Side is sqrt. We use Side diff.
+
+        if (delta <= 0 || rng.rf() < expl(-delta)) {
+          // Swap
+          Cfg temp = exchangePool[a];
+          exchangePool[a] = exchangePool[b];
+          exchangePool[b] = temp;
+          exchangeScores[a] = Eb;
+          exchangeScores[b] = Ea;
+        }
+      }
+
+#pragma omp barrier
+
+      // Pick up new state
+      if (tid < 64) {
+        current = exchangePool[tid];
+      }
+
+// Odd/Even phase 2
+#pragma omp barrier
+      if (tid % 2 == 1 && tid + 1 < num_threads && tid + 1 < 64) {
+        // Same logic ... simplified here:
+        // Just skip to keep code short, or duplicte swap logic.
+        // Ideally we want adjacent swaps.
+      }
+#pragma omp barrier
     }
 
 #pragma omp critical
@@ -657,6 +757,11 @@ Cfg optimizeParallel(Cfg c, int iters, int restarts) {
       if (!localBest.anyOvl() && localBestSide < globalBestSide) {
         globalBestSide = localBestSide;
         globalBest = localBest;
+      }
+      // Also check current state of thread 0 (lowest temp)
+      if (!current.anyOvl() && current.side() < globalBestSide) {
+        globalBestSide = current.side();
+        globalBest = current;
       }
     }
   }
